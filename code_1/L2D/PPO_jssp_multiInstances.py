@@ -107,8 +107,12 @@ class PPO:
         
         mini_batch_size = 64
         avg_loss = 0
-        
-        for _ in range(self.k_epochs):
+        target_kl = 0.015
+
+        for epoch in range(self.k_epochs):
+            
+            # Biến để theo dõi KL trung bình trong epoch này
+            epoch_kls = []
             np.random.shuffle(indices)
             
             for start in range(0, total_steps, mini_batch_size):
@@ -151,6 +155,16 @@ class PPO:
                 v_loss = self.V_loss_2(vals.squeeze(), mb_rewards)
                 p_loss = -torch.min(surr1, surr2).mean()
                 
+                
+                # --- THÊM ĐOẠN NÀY ĐỂ TÍNH KL DIVERGENCE ---
+                with torch.no_grad():
+                    # xấp xỉ KL: (old_log_probs - new_log_probs)
+                    # logprobs là new, mb_old_probs là old
+                    log_ratio = logprobs - mb_old_probs
+                    approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
+                    epoch_kls.append(approx_kl.item())
+                # -------------------------------------------
+
                 loss = configs.vloss_coef * v_loss + configs.ploss_coef * p_loss - current_ent_coef * ent_loss
                 
                 self.optimizer.zero_grad()
@@ -158,6 +172,12 @@ class PPO:
                 self.optimizer.step()
                 
                 avg_loss += loss.item()
+                # --- LOGIC QUAN TRỌNG: KIỂM TRA KL ĐỂ DỪNG SỚM ---
+            mean_kl = np.mean(epoch_kls)
+            if mean_kl > target_kl * 1.5:
+                # Nếu policy thay đổi quá nhiều, dừng update epoch này ngay
+                # Để bảo toàn những gì đã học
+                break
                 
         self.policy_old.load_state_dict(self.policy.state_dict())
         if configs.decayflag:
@@ -235,7 +255,21 @@ def main():
 
     for i_update in range(configs.max_updates):
         frac = 1.0 - (i_update - 1.0) / configs.max_updates
-        current_ent_coef = max(configs.entloss_coef * frac, 0.005)
+        current_ent_coef = max(configs.entloss_coef * frac, 0.001) # Giảm min entropy xuống thấp hơn nữa (0.001)
+        # 2. Learning Rate Decay thủ công (Logic chặt chẽ hơn)
+        # Giai đoạn đầu (0-4000): LR = 3e-4
+        # Giai đoạn giữa (4000-8000): LR giảm dần về 1e-4
+        # Giai đoạn cuối (8000-10000): LR = 5e-5 (Rất nhỏ để hội tụ)
+        if i_update < 4000:
+            current_lr = 3e-4
+        elif i_update < 8000:
+            current_lr = 1e-4
+        else:
+            current_lr = 5e-5
+            
+        # Cập nhật LR vào optimizer
+        for param_group in ppo.optimizer.param_groups:
+            param_group['lr'] = current_lr
         
         ppo.policy_old.eval()
         
